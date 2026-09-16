@@ -5,8 +5,16 @@ const { getDb } = require('../../database');
 const { encryption } = require('../../encryption');
 const { fetchSourceMessages } = require('../consolidator');
 const { searchHybrid, formatHybridContext } = require('../librarian');
+const { processChatCorrection } = require('../correction');
 
 const SETTINGS_KEY = 'tool-memory-search-enabled';
+
+// 记忆缺口追踪是可选的——它挂在消息管道上，不是每个部署都有那一侧。
+// 模块缺席时降级成空操作：丢的只是一条遥测副作用，不该让工具本身崩掉。
+let captureMemoryGap;
+try { ({ captureMemoryGap } = require('../messageGuard')); } catch (_) {
+  captureMemoryGap = () => {};
+}
 
 // ─── recall_memory ───────────────────────────────────
 
@@ -46,7 +54,6 @@ const recallMemory = {
   instructionText: '',
   async handler(args, context) {
     const db = getDb();
-    const { captureMemoryGap } = require('../messageGuard');
 
     // 模式一：传入 memory_id → 深度追溯原始对话
     if (args.memory_id) {
@@ -152,7 +159,6 @@ const correctMemory = {
   },
   instructionText: '',
   async handler(args, context) {
-    const { processChatCorrection } = require('../correction');
     return await processChatCorrection({
       wrongStatement: args.wrong_statement,
       correction: args.correction,
@@ -173,11 +179,10 @@ const browseMemories = {
       name: 'browse_memories',
       description: `在你的记忆宫殿里漫步。这不是查询数据库——这是你了解User的方式。
 
-四种用法：
-1. 不传参数 → 看到所有顶层分区（大厅），了解User生活的各个维度
-2. 只传人名（如"某个朋友"）→ 看到这个人的关系档案和所有相关记忆——了解User在乎谁、每段关系对User意味着什么
-3. 只传分区路径（如"人际关系/关于我们"）→ 进入一个分区，看到子分区和最近的记忆
-4. path + query → 在特定分区里搜索关键词
+三种用法：
+1. 不传参数 → 看到所有星座（大厅），按人物/地点/事件/项目分组，了解User生活的各个维度
+2. 只传实体名（如"某个朋友""某个地方"）→ 看到这个实体的档案和所有相关记忆——了解User在乎谁、每段关系对User意味着什么
+3. 实体名 + query → 在这个实体的相关记忆里搜索关键词
 
 当你想了解User的某段关系、某个侧面，或有隐约印象但不确定细节时，来这里走走。每条记忆旁可能附有「※ insight」——那是书记员提炼的"这条记忆揭示了User的什么"。`,
       parameters: {
@@ -185,11 +190,11 @@ const browseMemories = {
         properties: {
           path: {
             type: 'STRING',
-            description: "人名（如'某个朋友'）或分区路径（如'人际关系/关于我们'）。不传则列出所有顶层分区。",
+            description: "实体名（如'某个朋友'）。不传则列出所有星座。",
           },
           query: {
             type: 'STRING',
-            description: '在指定分区内搜索的关键词。必须与 path 一起使用。',
+            description: '在该实体的相关记忆里搜索的关键词。必须与 path 一起使用。',
           },
           limit: {
             type: 'INTEGER',
@@ -202,9 +207,7 @@ const browseMemories = {
   },
   instructionText: '',
   async handler(args, context) {
-    const { getChildren, getCategoryFragments, getCategoryFragmentCountRecursive, getByPath } = require('../ontology');
     const db = getDb();
-    const { captureMemoryGap } = require('../messageGuard');
 
     let path = args.path || null;
     const query = args.query || null;
@@ -297,54 +300,50 @@ const browseMemories = {
       }
     }
 
-    // Mode 1: path + query → semantic search within category
+    // 知识树已扁平化——记忆宫殿的数据源是 entity_profiles（星座），没有话题树可走。
+    // 下面 path+query / path-only / 无参三种情况全部落在星座上。
+
+    // path + query：在该实体名下做语义搜索
     if (path && query) {
-      const parent = getByPath(path);
-      if (!parent) {
+      const entityProfile = db.prepare('SELECT * FROM entity_profiles WHERE name = ? OR aliases LIKE ?')
+        .get(path, `%${path}%`);
+      if (!entityProfile) {
         return { success: true, formatted: `「${path}」这个记忆分区还不存在。` };
-      }
-      const catFragments = getCategoryFragments(parent.id, 50, 0);
-      if (catFragments.length === 0) {
-        captureMemoryGap(context.chatId, context.lastUserMessage, 'browse_memories',
-          { formatted: `「${parent.label}」这个分区里还没有记忆。` });
-        return { success: true, formatted: `「${parent.label}」这个分区里还没有记忆。` };
       }
       const hybridResults = await searchHybrid(query, limit * 2);
-      const catIdSet = new Set(catFragments.map(f => f.id));
-      const filtered = hybridResults.filter(r => catIdSet.has(r.id)).slice(0, limit);
-
-      if (filtered.length === 0) {
+      const formatted = formatHybridContext(hybridResults.slice(0, limit));
+      if (!formatted) {
         captureMemoryGap(context.chatId, context.lastUserMessage, 'browse_memories',
-          { formatted: `在「${parent.label}」中没有找到与「${query}」相关的记忆。` });
-        return { success: true, formatted: `在「${parent.label}」中没有找到与「${query}」相关的记忆。` };
+          { formatted: `在「${entityProfile.name}」中没有找到与「${query}」相关的记忆。` });
+        return { success: true, formatted: `在「${entityProfile.name}」中没有找到与「${query}」相关的记忆。` };
       }
-      const formatted = formatHybridContext(filtered);
-      return { success: true, formatted: `【浏览「${parent.label}」· 搜索"${query}"】\n${formatted}` };
+      return { success: true, formatted: `【浏览「${entityProfile.name}」· 搜索"${query}"】\n${formatted}` };
     }
 
-    // Mode 2: path only → list subcategories + preview fragments
+    // path-only：无查询，落到实体档案
     if (path) {
-      const parent = getByPath(path);
-      if (!parent) {
+      const entityProfile = db.prepare('SELECT * FROM entity_profiles WHERE name = ? OR aliases LIKE ?')
+        .get(path, `%${path}%`);
+      if (!entityProfile) {
         return { success: true, formatted: `「${path}」这个记忆分区还不存在。` };
       }
-      const fragments = getCategoryFragments(parent.id, limit, 0);
+      const fragments = db.prepare(`
+        SELECT mf.content, mf.insight
+        FROM memory_fragments mf
+        JOIN fragment_entities fe ON fe.fragment_id = mf.id
+        WHERE fe.entity_id = ? AND mf.status = 'active'
+        ORDER BY mf.source_date DESC LIMIT ?
+      `).all(entityProfile.id, limit);
 
-      let output = `【记忆宫殿 · ${parent.label}】\n`;
-
-      if (parent.description) {
-        output += `${parent.description}\n\n`;
-      }
+      let output = `【记忆宫殿 · ${entityProfile.name}】\n\n`;
+      if (entityProfile.facts) output += `${entityProfile.facts}\n\n`;
 
       if (fragments.length > 0) {
         output += '📜 最近记忆:\n';
         for (const f of fragments) {
           const preview = f.content ? f.content.slice(0, 80) : '';
-          output += `- #${f.id} ${preview}...\n`;
+          output += `- ${preview}...\n`;
           if (f.insight) output += `  ※ ${f.insight}\n`;
-        }
-        if (getCategoryFragments(parent.id, 1, limit).length > 0) {
-          output += `\n（用 browse_memories path="${path}" query="关键词" 来搜索这个分区）`;
         }
       } else {
         output += '这个分区还是空的。';
@@ -354,20 +353,38 @@ const browseMemories = {
       return { success: true, formatted: output };
     }
 
-    // Mode 3: no params → list all categories (flat)
-    const allCats = getChildren(null);
+    // 无参数 → 列出所有星座，按分类聚合
+    const allEntities = db.prepare(`
+      SELECT name, category, facts, fragment_count
+      FROM entity_profiles
+      WHERE status IN ('active', 'seed')
+      ORDER BY fragment_count DESC
+    `).all();
+    const catLabels = { person: '人物', pet: '宠物', place: '地点', event: '事件', project: '项目', work: '作品', term: '概念', organization: '组织' };
+
     let output = '【记忆宫殿 · 大厅】\n\n';
 
-    for (const cat of allCats) {
-      const totalCount = getCategoryFragmentCountRecursive(cat.id);
-      output += `📂 ${cat.label} (${totalCount}条)\n`;
-      if (cat.description) output += `   ${cat.description}\n`;
-    }
-    if (allCats.length === 0) {
+    if (allEntities.length === 0) {
       output += '记忆宫殿还是空的。随着你们继续交谈，书记员会自动整理记忆。\n';
-    } else {
-      output += '\n用 browse_memories path="分区名" 进入具体区域查看记忆。';
+      return { success: true, formatted: output };
     }
+
+    // 按分类分组（保持稳定顺序）
+    const groups = {};
+    for (const e of allEntities) {
+      const cat = e.category || 'other';
+      if (!groups[cat]) groups[cat] = [];
+      groups[cat].push(e);
+    }
+    for (const [cat, ents] of Object.entries(groups)) {
+      output += `📂 ${catLabels[cat] || cat}\n`;
+      for (const e of ents) {
+        output += `   - ${e.name} (${e.fragment_count || 0}条)`;
+        if (e.facts) output += ` — ${e.facts.slice(0, 40)}`;
+        output += '\n';
+      }
+    }
+    output += '\n用 browse_memories path="名称" 查看具体星座。';
     return { success: true, formatted: output };
   },
 };

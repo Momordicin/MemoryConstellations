@@ -138,8 +138,43 @@ async function main() {
         if (!raw.source_routing || typeof raw.source_routing !== 'object') throw new Error('source_routing 缺失或格式错误');
     });
 
-    // ── 6. ChromaDB ──
-    console.log('\n── 6. ChromaDB ──');
+    // ── 6. 工具注册表 ──
+    // 只加载 + 校验声明，不执行 handler（handler 会写库）。
+    // 这一层此前完全没有覆盖：工具文件里一个 require 解析不到，
+    // 冒烟测试照样全绿，而线上每一次工具调用都会崩。
+    console.log('\n── 6. 工具注册表 ──');
+    await asyncTest('加载 services/tools/index.js', async () => {
+        const tools = require('../services/tools/index.js');
+        const { getUserSetting } = require('../utils/settings');
+        const { functionDeclarations } = await tools.getEnabledTools({ getUserSetting });
+
+        if (!functionDeclarations.length) throw new Error('没有任何启用的工具');
+
+        for (const d of functionDeclarations) {
+            if (!d.name) throw new Error('工具缺 name');
+            if (!d.description) throw new Error(`${d.name} 缺 description`);
+            if (!d.parameters) throw new Error(`${d.name} 缺 parameters`);
+        }
+        console.log(`      已注册: ${functionDeclarations.map(d => d.name).join(', ')}`);
+    });
+
+    await asyncTest('每个工具都暴露了可调用的 handler', () => {
+        // 直接 require 工具模块，逐个校验形状——不真调 handler（会写库）
+        const toolList = [
+            ...require('../services/tools/memoryTools'),
+            require('../services/tools/manageUserState'),
+        ];
+        if (!toolList.length) throw new Error('工具清单为空');
+        for (const t of toolList) {
+            if (!t.name) throw new Error('工具缺 name');
+            if (typeof t.getFunctionDeclaration !== 'function') throw new Error(`${t.name} 缺 getFunctionDeclaration`);
+            if (typeof t.handler !== 'function') throw new Error(`${t.name} 缺 handler`);
+        }
+        console.log(`      已注册: ${toolList.map(t => t.name).join(', ')}`);
+    });
+
+    // ── 7. ChromaDB ──
+    console.log('\n── 7. ChromaDB ──');
     await asyncTest('ChromaDB heartbeat', async () => {
         const { chromaDBOperation } = require('../services/memory');
         const r = await chromaDBOperation('heartbeat');

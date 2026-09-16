@@ -270,9 +270,15 @@ Two modes:
 - **Keyword search** (`query`): Your companion searches their memory by keyword or phrase. Returns matching fragments and episodes.
 - **Source trace** (`memory_id` + `offset`): Given a memory ID, trace back to the original conversation messages that produced it.
 
-### `browse_memories` — Browse entity profiles
+### `browse_memories` — Browse the constellations
 
-No parameters needed. Returns a top-level view of all memory partitions — people, places, events, projects. Your companion can see who they know about and how many memories are linked to each person.
+The memory palace is organized as constellations — one per entity (person, place, event, project…). Three ways in:
+
+- **No parameters**: the hall — every constellation, grouped by category, each with a memory count and a one-line summary.
+- **`path` only** (an entity name, e.g. `"someone they know"`): that entity's profile plus its most recent linked memories, each with the archivist's `※ insight` line where one exists.
+- **`path` + `query`**: semantic search within that entity's memories.
+
+Names match exactly first, then fuzzily; an ambiguous name returns a shortlist of candidates rather than guessing.
 
 ### `manage_user_state` — Track user state
 
@@ -285,7 +291,9 @@ States auto-expire. Your companion sees active ones in their intuition block and
 
 ### `correct_memory` — Handle corrections
 
-When you tell your companion they remembered something wrong, they call this to record the correction. The system traces whether the error came from a specific memory fragment (fixes that fragment) or was something they made up (stores the correct version).
+When you tell your companion they remembered something wrong, they call this to record the correction. The system gathers candidate memories (working-memory pool + vector search) and asks a model whether the wrong statement actually came from one of them — if it did, that memory is cooled down and a corrected fragment is written; if it didn't, the mistake is logged as a hallucination and the correct version is stored as a new memory.
+
+Corrections accumulate in `correction_log`. Once 10 are active they get merged into long-term "editing guidelines", and both the recent corrections and those guidelines are injected into Scribe's prompt — so the same mistake doesn't get re-extracted later. See `services/correction.js`.
 
 ---
 

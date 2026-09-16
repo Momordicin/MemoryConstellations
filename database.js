@@ -1157,6 +1157,16 @@ function initDatabase() {
             END;
     `);
 
+    // v103: 补 memory_fragments.insight。
+    // v63 那一整块的第一条 ALTER 是 entity_profiles ADD COLUMN relationship_to_user，
+    // 而建表时 entity_profiles 已带该列 → 撞 "duplicate column" →
+    // runMigration 判定「整块早跑过」，记个版本号就跳过，
+    // 后面那句 ALTER TABLE memory_fragments ADD COLUMN insight 一次都没执行过。
+    // 全新库因此缺这一列：browse_memories 的实体分支、archivist.extractFragmentInsights
+    // 都会报 no such column。单开一条迁移补上（列已存在时自动跳过）。
+    runMigration(103, 'v5.17: 补 memory_fragments.insight（v63 整块被跳过导致漏建）',
+        `ALTER TABLE memory_fragments ADD COLUMN insight TEXT;`);
+
     // 种子数据：初始本体论类别（仅当表为空时插入）
     try {
         const existingRoots = db.prepare('SELECT COUNT(*) as c FROM memory_ontology WHERE parent_id IS NULL').get();
