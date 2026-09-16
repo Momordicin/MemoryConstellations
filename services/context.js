@@ -320,7 +320,7 @@ ${libText}
                     .map(e => `  ${e.label}：${e.detail}`);
                 return [header, ...details].join('\n');
             });
-            const logText = `你最近在庇护所里的活动记录（同一轮 = 同一段，缩进内容是每步的具体信息）:\n${lines.join('\n')}`;
+            const logText = `你最近的活动记录（同一轮 = 同一段，缩进内容是每步的具体信息）:\n${lines.join('\n')}`;
             dynamicParts.push(`<recent_activity>\n${logText}\n</recent_activity>`);
             estimatedTokens += Math.ceil(logText.length / 4);
         }
