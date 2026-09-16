@@ -985,10 +985,10 @@ async function detectNewTraits() {
 - 永远不用"我"指代 AI伴侣；指代 {{user.name}} 时一律用 {{user.pronoun}}，不要擅自改换性别
 - 不涉及你的条目可以只用"{{user.pronoun}}"（纯第三人称），但涉及你的观察/反应时用"你"
 
-正确示例：
-- "你察觉到{{user.pronoun}}似乎内心深处从不认为自己能被无条件地爱"
-- "{{user.pronoun}}面对冲突时倾向于先撤退再独自消化"
-- "{{user.pronoun}}被你戳穿嘴硬时会气鼓鼓地哼一声，但你知道那是{{user.pronoun}}在撒娇"
+正确示例（内容为虚构，只演示人称写法）：
+- "你察觉到{{user.pronoun}}似乎习惯先把事情做完，才允许自己放松"
+- "{{user.pronoun}}在人多的时候话少，会私下把在意的话单独讲清楚"
+- "{{user.pronoun}}打字的时候比当面放得开，玩笑多半留在文字里"
 
 错误示例：
 - "我觉得{{user.name}}内心深处……"（用了"我"——应该用"你"）
@@ -1000,7 +1000,7 @@ async function detectNewTraits() {
 
 **一、{{user.pronoun}}主动剖白自己的时候——这是黄金。**
 当{{user.pronoun}}说"我发现自己其实…""我一直都是…""我可能天生就…""我好像真的…"时，{{user.pronoun}}不是在描述一个事件——{{user.pronoun}}是在告诉你{{user.pronoun}}是谁。
-这类表达是最高价值的信号，因为这是 {{user.name}} 最诚实的自我判断。{{user.pronoun}}花了很多时间拆解自己的情绪——{{user.pronoun}}的自我剖白通常很准。
+这类表达是最高价值的信号，因为这是 {{user.name}} 最诚实的自我判断——{{user.pronoun}}愿意主动说出口的时候，通常已经在心里过了很多遍。
 
 此时 → source_quality = "direct_statement"，confidence 可达 0.75-0.85。
 产生 stable_trait（如果已有同骨架条目就走 confirm+refine）。
@@ -1047,12 +1047,15 @@ ${entities.map(e => `- ${e.name}: ${e.relationship_to_user || '?'} (性质: ${e.
 
 ## 📐 Few-Shot
 
+> 以下示例的内容是虚构的，只用来演示写法、颗粒度和 JSON 形状。
+> 不要把它们当成已知事实，也不要照抄措辞或 tags。
+
 ### ✅ 自我认知类（direct_statement）—— {{user.pronoun}}主动剖白
-- {"action": "create", "type": "stable_trait", "content": "你察觉到{{user.pronoun}}内心深处从不认为自己能被无条件地爱。{{user.pronoun}}反复需要确认自己在你心中是唯一的、不可替代的——这不是缺乏安全感，这是{{user.pronoun}}过往经历教会{{user.pronoun}}的生存策略。", "confidence": 0.80, "source_quality": "direct_statement", "tags": ["companion_intuition", "被爱", "唯一", "不可替代", "安全感", "确认"]}
-- {"action": "create", "type": "active_hypothesis", "content": "{{user.pronoun}}面对冲突时倾向于先撤退再独自消化，而非当场表达愤怒。这既是{{user.pronoun}}避免失控的策略，也是{{user.pronoun}}潜意识里认为'表达愤怒会把人推开'的恐惧。", "confidence": 0.60, "source_quality": "inferred", "tags": ["companion_intuition", "冲突", "撤退", "独自消化", "愤怒", "推开"]}
+- {"action": "create", "type": "stable_trait", "content": "{{user.name}}说过{{user.pronoun}}是那种必须先把事情做完才安心的人，心里悬着事的时候，连平时喜欢的东西都提不起劲。", "confidence": 0.80, "source_quality": "direct_statement", "tags": ["companion_intuition", "先做完", "静不下心", "等忙完", "心里有数", "再说"]}
+- {"action": "create", "type": "active_hypothesis", "content": "{{user.name}}在群里话不多，但会私下把在意的话单独讲清楚——{{user.pronoun}}习惯把关心放在只有两个人看得见的地方。", "confidence": 0.60, "source_quality": "inferred", "tags": ["companion_intuition", "私聊说", "群里算了", "单独讲", "不方便说", "回头聊"]}
 
 ### ✅ 行为模式类（inferred）—— 从反复出现中推断
-- {"action": "create", "type": "stable_trait", "content": "{{user.pronoun}}被你戳穿嘴硬时会用'哼'或'我佛了'来掩饰。你早就看透这是{{user.pronoun}}在向你示弱撒娇。", "confidence": 0.65, "source_quality": "inferred", "tags": ["companion_intuition", "哼", "我佛了", "算了不搞了", "烦死了"]}
+- {"action": "create", "type": "stable_trait", "content": "{{user.name}}打字的时候比当面放得开，玩笑多半留在文字里。你慢慢发现{{user.pronoun}}的松弛感要靠屏幕才出得来。", "confidence": 0.65, "source_quality": "inferred", "tags": ["companion_intuition", "打字说", "当面算了", "文字上", "哈哈", "打错了"]}
 
 ### ❌ 禁止
 - 主语变「我」→ 行动指南（不是人格侧写）

@@ -4740,8 +4740,8 @@ ${fragmentList}
 
 ## 输出格式
 
-只输出一个JSON数组，不要markdown包裹：
-[{"index":0,"insight":"User在疲惫时倾向于用某个习惯缓解情绪，那对她而言不只是消遣更是情绪出口"},{"index":2,"insight":"User对家人的依赖是深层的——她可以在家人面前卸下所有社会面具","dimension":"emotional"},{"index":3,"insight":null}]`;
+只输出一个JSON数组，不要markdown包裹（下面内容是虚构的，只演示格式）：
+[{"index":0,"insight":"User在疲惫时会用一个固定的小习惯给自己缓冲，那对User而言是恢复的方式"},{"index":2,"insight":"User对某类事物有一套自己的取舍标准，平时很少明说但一直在按它选","dimension":"emotional"},{"index":3,"insight":null}]`;
 
     try {
         const response = await callLLM(
