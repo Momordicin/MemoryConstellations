@@ -223,11 +223,15 @@ function drawCore(T, cx, cy, orbitR, alpha, hovered) {
         corePos.push({ name, x: ex, y: ey, r: rr * 3, ent });
     });
     // 双星间细弱光弧
+    // ⚠️ 颜色必须按名字现查：CORE_STYLE 的键是上面用 [UI.user.name] / [UI.ai.name]
+    // 动态开出来的，写成字面 key（如 CORE_STYLE.AI）时，只要配置名不是那个字面值
+    // 就取到 undefined，每帧抛 TypeError → 渲染循环断链 → 星图永远停在尘埃帧。
     if (corePos.length === 2) {
         const [a, b] = corePos;
+        const rg = n => (CORE_STYLE[n] || { rgb: '255,255,255' }).rgb;
         const lg = ctx.createLinearGradient(a.x, a.y, b.x, b.y);
-        lg.addColorStop(0, `rgba(${CORE_STYLE.User.rgb},${0.16 * alpha})`);
-        lg.addColorStop(1, `rgba(${CORE_STYLE.AI.rgb},${0.16 * alpha})`);
+        lg.addColorStop(0, `rgba(${rg(a.name)},${0.16 * alpha})`);
+        lg.addColorStop(1, `rgba(${rg(b.name)},${0.16 * alpha})`);
         ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y);
         ctx.strokeStyle = lg; ctx.lineWidth = 0.7; ctx.stroke();
     }

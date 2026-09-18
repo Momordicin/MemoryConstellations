@@ -203,6 +203,7 @@ async function refresh() {
 
 // ── 主循环 ──
 let T = 0;
+let frameErrors = 0;   // 连续异常计数（只用于降噪，不影响链路）
 function loop() {
     // 空闲降帧：>3s 无交互 → 隔帧渲染（~30fps）
     if (Date.now() - lastInteraction > 3000) {
@@ -210,7 +211,15 @@ function loop() {
         if (frameSkip) { requestAnimationFrame(loop); return; }
     }
     T += 0.012;
-    drawFrame(T, hovered);
+    // 单帧异常不许杀掉 RAF 链：抛出去就再也不会被调度，画面静默冻结在最后一帧，
+    // 从外部看是「页面点了没反应」，极难往渲染循环上想。这里吞掉异常、继续下一帧，
+    // 但连续抛错说明不是偶发，前几次打进控制台留线索。
+    try {
+        drawFrame(T, hovered);
+        frameErrors = 0;
+    } catch (err) {
+        if (++frameErrors <= 3) console.error('[memory] drawFrame error:', err);
+    }
     requestAnimationFrame(loop);
 }
 
