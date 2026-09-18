@@ -4,8 +4,9 @@
 const { getDb } = require('../../database');
 const { encryption } = require('../../encryption');
 const { fetchSourceMessages } = require('../consolidator');
-const { searchHybrid, formatHybridContext } = require('../librarian');
+const { searchHybrid, formatHybridContext, getEntityFragments } = require('../librarian');
 const { processChatCorrection } = require('../correction');
+const { USER } = require('../memoryConfig');
 
 const SETTINGS_KEY = 'tool-memory-search-enabled';
 
@@ -14,6 +15,121 @@ const SETTINGS_KEY = 'tool-memory-search-enabled';
 let captureMemoryGap;
 try { ({ captureMemoryGap } = require('../messageGuard')); } catch (_) {
   captureMemoryGap = () => {};
+}
+
+// ── 共用小工具 ───────────────────────────────────────
+
+// 名字 → 星座。精确名/别称优先，落空再做一次模糊匹配（唯一命中才算，
+// 多个候选宁可当成没找到——猜错人比没查到更糟）。
+function resolveEntityRow(db, name) {
+  if (!name) return null;
+  const exact = db.prepare('SELECT * FROM entity_profiles WHERE name = ? OR aliases LIKE ?')
+    .get(name, `%${name}%`);
+  if (exact) return exact;
+  const fuzzy = db.prepare(`
+    SELECT * FROM entity_profiles
+    WHERE (name LIKE ? OR name LIKE ? OR aliases LIKE ?)
+      AND status IN ('active', 'seed')
+    ORDER BY fragment_count DESC LIMIT 5
+  `).all(`%${name}%`, `${name}%`, `%${name}%`);
+  return fuzzy.length === 1 ? fuzzy[0] : null;
+}
+
+// 关联星座一行。related_entities（{id,name,relation,shared_count}）由关系发现
+// 写进双方档案——把它带进工具输出，模型看到名字就能顺着再查一次。
+function formatRelatedLine(entityProfile, db, limit = 3) {
+  let rels = [];
+  try { rels = JSON.parse(entityProfile.related_entities || '[]'); } catch (_) {}
+  if (!Array.isArray(rels) || rels.length === 0) return '';
+  const parts = rels.filter(r => r && r.name).slice(0, limit)
+    .map(r => (r.relation ? `${r.name}（${r.relation}）` : r.name));
+  return parts.length ? `\n↳ 关联星座：${parts.join('、')}` : '';
+}
+
+// 消息正文存的是 components JSON（文本段里混着表情/图片占位）。
+// 取纯文本要收**所有** type==='text' 且非 hidden 的段——不能只取第一条：
+// 一条消息常被切成好几段（动作标记 + 正文 + 正文），只取第一条会只剩个动作标记。
+function messageText(raw) {
+  if (!raw) return '';
+  try {
+    const parsed = JSON.parse(raw);
+    if (parsed && Array.isArray(parsed.components)) {
+      return parsed.components
+        .filter(c => c.type === 'text' && !c.hidden && c.content)
+        .map(c => c.content).join('');
+    }
+    if (Array.isArray(parsed)) {
+      return parsed.filter(p => p.type === 'text').map(p => p.text || p.content || '').join('');
+    }
+    if (typeof parsed === 'string') return parsed;
+  } catch (_) {}
+  return String(raw);
+}
+
+// 给「不走 searchHybrid」的行补新鲜度标注（entity / date 这两条路）。
+// formatHybridContext 靠 _daysAgo + _confidence + _source 算「可引用/需谨慎/仅联想」，
+// 三个字段缺了会被算成「999 天 · low」→ 每一行都标「仅联想」，等于告诉模型
+// "这些别当事实说"。星座归属和按日期捞都是单通道命中，标 medium（=需谨慎）是诚实的口径。
+function annotateFreshness(rows, source = 'ENTITY') {
+  const now = Date.now();
+  for (const r of rows) {
+    if (r._daysAgo == null) {
+      const label = (r.source_table === 'fragment' ? r.date_label : null) || r.created_at || r.date_label;
+      const d = label ? new Date(label) : null;
+      r._daysAgo = (d && !isNaN(d.getTime()))
+        ? Math.max(0, Math.round((now - d.getTime()) / 86400000))
+        : 365;
+    }
+    if (r._confidence == null) r._confidence = 'medium';
+    if (r._source == null) r._source = source;
+  }
+  return rows;
+}
+
+// include_source：把命中记忆对应的原始对话带出来。
+// 只取前 cap 条、每条最多 perItem 句——原始对话是按整段回的，不设上限会吃掉整轮预算。
+function buildSourceBlock(rows, db, cap = 3, perItem = 15) {
+  const targets = rows.filter(r => r && r.id != null).slice(0, cap);
+  if (targets.length === 0) return '';
+
+  const idsOf = (table, ids) => {
+    if (ids.length === 0) return [];
+    return db.prepare(`SELECT id, source_msg_ids FROM ${table} WHERE id IN (${ids.map(() => '?').join(',')})`)
+      .all(...ids);
+  };
+  const sourceIdMap = new Map();
+  const num = (r) => Number(r.id);
+  for (const r of idsOf('memory_fragments', targets.filter(t => t.source_table === 'fragment').map(num))) {
+    sourceIdMap.set(`fragment-${r.id}`, r.source_msg_ids);
+  }
+  for (const r of idsOf('memories', targets.filter(t => t.source_table === 'memory').map(num))) {
+    sourceIdMap.set(`memory-${r.id}`, r.source_msg_ids);
+  }
+
+  let block = '';
+  for (const t of targets) {
+    const raw = sourceIdMap.get(`${t.source_table}-${t.id}`);
+    let msgIds = [];
+    try { msgIds = JSON.parse(raw || '[]'); } catch (_) {}
+    if (!Array.isArray(msgIds) || msgIds.length === 0) continue;
+
+    const msgs = fetchSourceMessages(msgIds);
+    if (!msgs || msgs.length === 0) continue;
+
+    // 纯表情/图片的消息抽出文本后是空的，别留成「[时间] 名字: 」的空行
+    const lines = msgs
+      .map(m => ({ time: (m.timestamp || '').slice(5, 16), sender: m.sender, text: messageText(m.content) }))
+      .filter(x => x.text);
+    if (lines.length === 0) continue;
+
+    const page = lines.slice(-perItem);   // 取最近的一段
+    const preview = (t.content || '').slice(0, 30);
+    block += `\n—— 原始对话 · ${preview}${t.content && t.content.length > 30 ? '…' : ''} ——\n`;
+    block += page.map(x => `[${x.time}] ${x.sender}: ${x.text.slice(0, 300)}`).join('\n');
+    if (lines.length > page.length) block += `\n（这一条更早的部分共 ${lines.length} 句，上面是最近的 ${page.length} 句。）`;
+    block += '\n';
+  }
+  return block;
 }
 
 // ─── recall_memory ───────────────────────────────────
@@ -25,46 +141,66 @@ const recallMemory = {
   getFunctionDeclaration() {
     return {
       name: 'recall_memory',
-      description: `访问你的'记忆库'（长期记忆库）。两种用法：
+      description: `回想你的记忆。
 
-1. 模糊搜索：传入 query 关键词或短句。返回匹配的记忆和片段。当你依稀记得某事但不确定细节、或{user}提到过去的事时使用。务必只引用工具返回的内容，不编造。
+【什么时候非得查不可】
+- 你要说出一件关于过去的、具体的事——谁、哪天、在哪、原话是什么——而你上面已经浮现的记忆里没有它。
+- ${USER.name} 问"你还记得…吗""我上次说的那个""当时怎么说的"。
+- 相对时间（昨天、上周、三天前）你要落成具体日期。
+- 你隐约有印象但细节对不上——宁可查一次，别把不确定说成确定。
+查不到就如实说没查到。
 
-2. 深度追溯：传入 memory_id（从上下文中记忆条目的 #数字 ID 获取，如「※ 可引用 · #112 · 15天前」中的 112）。返回该记忆的完整内容和原始对话记录，每页15条，offset=0 为最新页，offset=1 为更早的15条。当记忆标注为「仅联想」、或{user}追问细节、或你对某条记忆的真实性存疑时使用。这是你主动探索记忆的能力——你不是只能接收数据库塞给你的东西。
+【四种查法，可以组合】
+1. query —— 泛化关键词。想不起确切用词时给个大方向。
+2. entity —— 关于谁/哪里/哪件事，填星座名或别称。返回里会带这个星座的关联星座，
+   顺着再查一次就能摸到相邻的人和事。
+3. date —— 什么时候。单日 "2026-07-24"，或范围 "2026-07-21~2026-07-27"。
+4. memory_id —— 深度追溯某一条。ID 是上面结果里的 #数字。当某条标着「仅联想」、
+   对方追问细节、或你自己对它的真实性存疑时用；翻更早的原始对话加 offset。
 
-每次调用只能使用一种模式。`,
+【要原话的时候】
+${USER.name} 想看当时的原话、或要你复述细节 → include_source=true：把命中记忆对应的原始对话一并带出来。`,
       parameters: {
         type: 'OBJECT',
         properties: {
           query: {
             type: 'STRING',
-            description: '用于检索记忆的关键词或短句（模糊搜索模式）',
+            description: '关键词或短句。想不起确切用词时给个大方向。',
+          },
+          entity: {
+            type: 'STRING',
+            description: '星座名或别称（谁、哪里、哪件事）。返回里带这个星座的关联星座。',
+          },
+          date: {
+            type: 'STRING',
+            description: '日期过滤。单日"2026-07-24"，或范围"2026-07-21~2026-07-27"。相对时间自己换算。',
+          },
+          include_source: {
+            type: 'BOOLEAN',
+            description: 'true = 把命中记忆对应的原始对话一并带出来。要看原话、要复述细节时用。',
           },
           memory_id: {
             type: 'INTEGER',
-            description: '记忆或片段的数字ID，从上下文「※ 记忆 #ID」或「※ 相关记忆 #ID」中获取（深度追溯模式）',
+            description: '记忆或片段的数字ID，从上下文「※ 记忆 #ID」「※ 相关记忆 #ID」里取（深度追溯模式）',
           },
           offset: {
             type: 'INTEGER',
-            description: '深度追溯的翻页偏移。offset=0 返回最近15条，offset=1 返回更早的15条，以此类推。仅与 memory_id 配合使用。',
+            description: '深度追溯的翻页偏移。offset=0 返回最近15条，offset=1 返回更早的15条。仅与 memory_id 配合。',
           },
         },
       },
     };
   },
-  instructionText: '',
+  instructionText: '这是你的回想本能。\n\n你没有肉身，感应不到对方的物理世界——所有细节都沉在你们共同的记忆里。所以"想起来"对你不是比喻，是你唯一能碰到过去的动作。\n\n对方提起从前、你准备说出一件具体的事、或者你想用旧日的默契接住此刻的情绪——先去记忆里走一趟。开口前多翻一次，说出口的就都是你确实记得的。\n\n有一类时刻最容易漏：你正要说出一个具体的人名、日期、地点、或者一句原话，而此刻浮现的记忆里并没有它。这种时候先查——查到了就说你记得，没查到就说你想不起来了。',
   async handler(args, context) {
     const db = getDb();
 
-    // 模式一：传入 memory_id → 深度追溯原始对话
+    // 深度追溯：给定 ID → 那一条的完整内容 + 当时的原始对话（翻页用 offset）
     if (args.memory_id) {
       let record = db.prepare('SELECT id, content, source_msg_ids, valid_from, layer FROM memories WHERE id = ?').get(args.memory_id);
-      let sourceTable = 'memories';
-
       if (!record) {
         record = db.prepare('SELECT id, content, source_msg_ids, source_date AS valid_from, layer FROM memory_fragments WHERE id = ?').get(args.memory_id);
-        sourceTable = 'fragments';
       }
-
       if (!record) return { success: false, formatted: `记忆库中未找到ID为 ${args.memory_id} 的记忆。` };
 
       let content = record.content;
@@ -75,47 +211,180 @@ const recallMemory = {
 
       const dateLabel = record.valid_from ? ` · ${record.valid_from}` : '';
       const layerLabel = record.layer === 'episode' ? '记忆' : '事实';
-
       let formatted = `【追溯${layerLabel} #${record.id}${dateLabel}】\n${content}\n`;
 
-      if (sourceMsgIds.length > 0) {
-        const sourceMessages = await fetchSourceMessages(sourceMsgIds);
-        if (sourceMessages.length > 0) {
-          const pageSize = 15;
-          const offset = Math.max(0, parseInt(args.offset) || 0);
-          const totalPages = Math.ceil(sourceMessages.length / pageSize);
-          const startIdx = Math.max(0, sourceMessages.length - pageSize * (offset + 1));
-          const endIdx = sourceMessages.length - pageSize * offset;
-          const page = sourceMessages.slice(startIdx, endIdx);
+      const msgs = sourceMsgIds.length > 0 ? fetchSourceMessages(sourceMsgIds) : [];
+      const lines = (msgs || [])
+        .map(m => ({ time: (m.timestamp || '').slice(0, 16), sender: m.sender, text: messageText(m.content) }))
+        .filter(x => x.text);
 
-          formatted += `\n【原始对话 · 第${offset + 1}/${totalPages}页（共${sourceMessages.length}条）】\n`;
-          formatted += page.map(m => {
-            const time = (m.timestamp || '').slice(0, 16);
-            return `[${time}] ${m.sender}: ${m.content.slice(0, 500)}`;
-          }).join('\n');
-          if (startIdx > 0) {
-            formatted += `\n\n（以上为最近的消息。如需更早的消息，加上 offset=${offset + 1}。）`;
-          }
-          if (offset > 0) {
-            formatted += `\n（当前偏移 ${offset} 页。offset=0 回到最新页。）`;
-          }
-        } else {
-          formatted += `\n（该记忆没有关联的原始对话记录。）`;
-        }
-      } else {
-        formatted += `\n（该记忆没有关联的原始对话记录。）`;
+      if (lines.length === 0) {
+        formatted += '\n（该记忆没有关联的原始对话记录。）';
+        return { success: true, formatted };
       }
+
+      const pageSize = 15;
+      const totalPages = Math.ceil(lines.length / pageSize);
+      // 夹住 offset：翻过头会得到「第2/1页」+ 空页，不如直接停在第 1 页
+      const offset = Math.min(Math.max(0, parseInt(args.offset) || 0), totalPages - 1);
+      const startIdx = Math.max(0, lines.length - pageSize * (offset + 1));
+      const page = lines.slice(startIdx, lines.length - pageSize * offset);
+
+      formatted += `\n【原始对话 · 第${offset + 1}/${totalPages}页（共${lines.length}条）】\n`;
+      formatted += page.map(x => `[${x.time}] ${x.sender}: ${x.text.slice(0, 500)}`).join('\n');
+      if (startIdx > 0) formatted += `\n\n（以上为最近的消息。如需更早的消息，加上 offset=${offset + 1}。）`;
+      if (offset > 0) formatted += `\n（当前偏移 ${offset} 页。offset=0 回到最新页。）`;
 
       return { success: true, formatted };
     }
 
-    // 模式二：传入 query → 向量搜索
-    if (!args.query) return { success: false, formatted: '请提供检索关键词（query）或记忆ID（memory_id）。' };
+    if (!args.query && !args.date && !args.entity) {
+      return { success: false, formatted: '请给出 query（想什么）、entity（关于谁/哪里/哪件事）或 date（什么时候）中的至少一个。' };
+    }
 
-    const memories = await searchHybrid(args.query, 8);
-    if (memories.length > 0) {
-      const formatted = formatHybridContext(memories);
-      return { success: true, formatted: `【记忆库检索结果】\n${formatted}\n\n（如需追溯某条的原始对话，使用 recall_memory 并传入对应的记忆ID或片段ID。）` };
+    // 解析日期参数
+    let dateFrom = null, dateTo = null;
+    if (args.date) {
+      const parts = args.date.split('~');
+      dateFrom = parts[0].trim();
+      dateTo = (parts[1] || parts[0]).trim();
+    }
+
+    let memories = [];
+    let rawMessages = [];
+    let entityProfile = null;   // entity 模式命中时留着，输出里附关系网
+
+    // entity 查询：先落到星座，再取挂在它下面的碎片（走 fragment_entities 正典源）。
+    // query / date 同时给了就在星座内部再筛一层——「这个人」「这件事」+「关于什么/什么时候」
+    if (args.entity) {
+      entityProfile = resolveEntityRow(db, args.entity);
+      if (!entityProfile) {
+        return { success: true, formatted: `你的记忆里没有「${args.entity}」这个星座。换个说法，或者只用 query 搜关键词。` };
+      }
+      const kw = args.query ? args.query.toLowerCase() : null;
+      memories = annotateFreshness(getEntityFragments([entityProfile.id], 40).filter(r => {
+        if (dateFrom && !(r.date_label >= dateFrom && r.date_label <= dateTo)) return false;
+        if (kw && !(r.content || '').toLowerCase().includes(kw)) return false;
+        return true;
+      }), 'ENTITY');
+    } else if (dateFrom) {
+      const dateSql = args.query ? 'AND (content LIKE ? OR content LIKE ?)' : '';
+      const dateParams = args.query ? [`%${args.query}%`, `%${args.query}%`] : [];
+
+      // 记忆碎片
+      const frags = db.prepare(`
+        SELECT mf.id, mf.content, mf.emotional_weight AS weight, mf.source_date AS date_label,
+               mf.created_at, mf.read_count, mf.layer, 'fragment' AS source_table
+        FROM memory_fragments mf
+        WHERE mf.source_date >= ? AND mf.source_date <= ?
+          AND mf.status = 'active'
+          ${dateSql}
+        ORDER BY mf.source_date DESC, mf.emotional_weight DESC
+        LIMIT 15
+      `).all(dateFrom, dateTo, ...dateParams);
+      memories.push(...frags);
+
+      // 叙事记忆（episode）
+      const eps = db.prepare(`
+        SELECT m.id, m.title AS content, (m.weight / 10.0) AS weight,
+               m.valid_from AS date_label, m.created_at, m.layer, 'memory' AS source_table
+        FROM memories m
+        WHERE m.valid_from >= ? AND m.valid_from <= ?
+          AND m.layer = 'episode' AND m.status = 'permanent'
+          ${dateSql ? dateSql.replace(/content/g, 'm.title') : ''}
+        ORDER BY m.valid_from DESC
+        LIMIT 10
+      `).all(dateFrom, dateTo, ...dateParams);
+      memories.push(...eps);
+
+      // 去重
+      const seen = new Set();
+      memories = memories.filter(m => {
+        const key = `${m.source_table}-${m.id}`;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+      annotateFreshness(memories, 'DATE');
+
+      // 原始聊天记录（密文字段不能用 SQL LIKE 过滤，全量取出后 JS 层解密+过滤）
+      if (context && context.chatId != null) {
+        const allMsgs = db.prepare(`
+          SELECT sender, content, timestamp FROM messages
+          WHERE chat_id = ? AND timestamp >= ? AND timestamp <= ?
+          ORDER BY timestamp ASC
+          LIMIT 100
+        `).all(context.chatId, `${dateFrom} 00:00:00`, `${dateTo} 23:59:59`);
+
+        const keyword = args.query ? args.query.toLowerCase() : null;
+        for (const m of allMsgs) {
+          const text = messageText(encryption.decrypt(m.content));
+          if (!text) continue;
+          if (keyword && !text.toLowerCase().includes(keyword)) continue;
+          rawMessages.push({ sender: m.sender, content: text, timestamp: m.timestamp });
+        }
+      }
+    } else {
+      // 纯关键词搜索：走混合检索
+      memories = await searchHybrid(args.query, 8);
+
+      // 补查最近 7 天原始消息（fragments 可能尚未覆盖的近期对话）
+      if (context && context.chatId != null) {
+        const kw = args.query.toLowerCase();
+        const recent7 = db.prepare(`
+          SELECT sender, content, timestamp FROM messages
+          WHERE chat_id = ? AND timestamp >= datetime('now', '-7 days')
+          ORDER BY timestamp ASC
+          LIMIT 200
+        `).all(context.chatId);
+        for (const m of recent7) {
+          const text = messageText(encryption.decrypt(m.content));
+          if (!text || !text.toLowerCase().includes(kw)) continue;
+          rawMessages.push({ sender: m.sender, content: text, timestamp: m.timestamp });
+        }
+      }
+    }
+
+    if (memories.length > 0 || rawMessages.length > 0) {
+      let formatted = '';
+
+      if (dateFrom) {
+        formatted += `【${dateFrom === dateTo ? dateFrom : dateFrom + ' ~ ' + dateTo} 的记忆】\n`;
+      }
+
+      // entity 搜索：先把「这是谁/哪里/哪件事」和它的关系网摆出来，
+      // 模型看到相邻星座的名字就能再查一次——图就是这样一跳一跳走通的
+      if (entityProfile) {
+        const hint = (entityProfile.facts || entityProfile.current_status || '').slice(0, 80);
+        formatted += `【${entityProfile.name}】${hint ? ' ' + hint : ''}\n`;
+        const related = formatRelatedLine(entityProfile, db);
+        if (related) formatted += related + '\n';
+        if (args.query) formatted += `\n（上面是「${entityProfile.name}」里和「${args.query}」有关的）`;
+        formatted += '\n';
+      }
+
+      if (rawMessages.length > 0) {
+        formatted += `\n—— 原始对话 (${rawMessages.length}条) ——\n`;
+        for (const m of rawMessages) {
+          const t = (m.timestamp || '').slice(5, 16);
+          formatted += `[${t}] ${m.sender}: ${m.content.slice(0, 300)}\n`;
+        }
+      }
+
+      if (memories.length > 0) {
+        if (rawMessages.length > 0) formatted += '\n—— 记忆碎片 ——\n';
+        formatted += formatHybridContext(memories);
+      }
+
+      // 要原话：把命中记忆的原始对话带出来（不需要 ID）
+      if (args.include_source) {
+        formatted += '\n【原始对话】' + buildSourceBlock(memories, db);
+      }
+
+      const tail = args.include_source
+        ? ''
+        : '\n\n（想看某条的原始对话，用 recall_memory 加 include_source=true。）';
+      return { success: true, formatted: formatted.trim() + tail };
     }
     captureMemoryGap(context.chatId, context.lastUserMessage, 'recall_memory',
       { formatted: '记忆库中没有找到相关记忆。' });
@@ -132,11 +401,11 @@ const correctMemory = {
   getFunctionDeclaration() {
     return {
       name: 'correct_memory',
-      description: `修正你的记忆库。当User指出你记错了某件事时，调用此工具记录修正。
+      description: `修正你的记忆库。当${USER.name}指出你记错了某件事时，调用此工具记录修正。
 
 提供错误内容和正确版本。系统会自动检查你的记忆库，判断错误来源——是某条记忆写错了（会修正那条），还是你自己编造/混淆的（会记为新的正确记忆）。
 
-你也可以传入 memory_id 精确定位（从上下文中「※ 可引用 · #42 · 15天前」的 #数字 获取）。`,
+不确定自己记的是什么就说不知道，别为了圆场把错的写成对的。`,
       parameters: {
         type: 'OBJECT',
         properties: {
@@ -146,11 +415,7 @@ const correctMemory = {
           },
           correction: {
             type: 'STRING',
-            description: 'User给出的正确版本',
-          },
-          memory_id: {
-            type: 'INTEGER',
-            description: '[可选] 如果你知道是哪条记忆写错了，传入上下文中的 #数字 ID',
+            description: `${USER.name}给出的正确版本`,
           },
         },
         required: ['wrong_statement', 'correction'],
@@ -281,6 +546,12 @@ const browseMemories = {
 
         if (entityProfile.first_mentioned_date && entityProfile.last_mentioned_date) {
           output += `时间跨度：${entityProfile.first_mentioned_date} ～ ${entityProfile.last_mentioned_date}\n`;
+        }
+
+        // 关联星座：把相邻的名字摆出来，模型顺着再查一次就能往下走
+        {
+          const related = formatRelatedLine(entityProfile, db);
+          if (related) output += related + '\n';
         }
 
         if (fragments.length > 0) {
