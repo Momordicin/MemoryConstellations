@@ -275,11 +275,14 @@ router.get('/api/memory/universe', requireAuth, (req, res) => {
         // 映射到一个不存在的 id，星座就永远不会被画出来（项目/术语类曾因此整批消失）。
         const GALAXY_LABELS = { person:'社交', pet:'社交', organization:'社交', place:'地点', event:'事件', project:'创作', work:'创作', term:'创作', hobby:'爱好', consumed:'爱好', object:'爱好', music_aggregate:'爱好', book_aggregate:'爱好', movie_aggregate:'爱好' };
 
+        // ⚠️ 取 facts/judgment，不取 overview：v5.9 起 overview 列已退役（写入侧只写
+        // facts + current_status + judgment），前端面板读的也是 facts/judgment。
+        // 之前这里只 SELECT overview，前端拿不到内容，所有星座面板正文恒为空。
         const entities = db.prepare(`
-            SELECT ep.id, ep.name, ep.category, ep.subcategory, ep.overview, ep.fragment_count,
+            SELECT ep.id, ep.name, ep.category, ep.subcategory, ep.fragment_count,
                    ep.related_entities, ep.current_status, ep.status as lifecycle_status,
                    ep.updated_at, ep.created_at, ep.relationship_to_user, ep.aliases, ep.tags,
-                   ep.entity_type
+                   ep.entity_type, ep.facts, ep.judgment, ep.talking_points
             FROM entity_profiles ep
             WHERE ep.status = 'active' AND ep.fragment_count > 0
             ORDER BY
@@ -316,10 +319,12 @@ router.get('/api/memory/universe', requireAuth, (req, res) => {
         const coreEntities = entities.filter(e => CORE_NAMES.includes(e.name));
         const normalEntities = entities.filter(e => !CORE_NAMES.includes(e.name));
 
+        // 双星档案走 facts（前端 showCorePanel 读的就是 ent.facts）。
+        // 以前这里给的是 overview（已退役的列），面板永远取不到 → 只显示兜底文案。
         const core = coreEntities.map(ent => ({
             id: 'e' + ent.id,
             name: ent.name,
-            overview: ent.overview || '',
+            facts: ent.facts || '',
             fragment_count: ent.fragment_count,
             relationship: ent.relationship_to_user || '',
             currentStatus: ent.current_status || '',
@@ -409,13 +414,16 @@ router.get('/api/memory/universe', requireAuth, (req, res) => {
             return {
                 id: 'e' + ent.id,
                 label: ent.name,
-                description: ent.overview || '',
+                description: ent.facts || '',
                 color: GALAXY_COLORS[cat] || '#8899aa',
                 depth,
                 fragment_count: ent.fragment_count,
                 stars,
                 episodes,
                 // Entity-specific fields
+                facts: ent.facts || '',
+                judgment: ent.judgment || '',
+                talking_points: ent.talking_points || '[]',
                 category: cat,
                 subcategory: ent.subcategory || '',
                 galaxyLabel: GALAXY_LABELS[cat] || cat,

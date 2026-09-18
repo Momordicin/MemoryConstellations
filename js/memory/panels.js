@@ -287,9 +287,11 @@ export function showConPanel(con) {
 
 function _renderConBody(con) {
     // 近况（current_status） — 放在 body 最前面
+    // ⚠️ 取 camelCase 的 currentStatus：后端 /api/memory/universe 映射出来的是这个名。
+    // 以前这里读下划线写法，永远 undefined，近况那一行从来没渲染过。
     let bodyHtml = '';
-    if (con.current_status) {
-        bodyHtml += '<div class="p-cs">' + con.current_status + '</div>';
+    if (con.currentStatus) {
+        bodyHtml += '<div class="p-cs">' + con.currentStatus + '</div>';
     }
     let mainText = '';
     if (_conPanelMode === 'facts') {
