@@ -2214,10 +2214,14 @@ B: ${b.name} (${b.fragment_count}条碎片)
 }
 
 // 合并执行（事务）：自动快道与人工确认 API 共用。返回 true=成功。
+// 合并时要跟着存活者走的关系列。败者会被标 status='merged'，而 merged 行没有任何
+// 查询会再读，留在那儿等于永久丢失；这三列也不参与 overview 重生成，不会自己长回来。
+const MERGE_CARRY_COLS = ['relationship_to_user', 'relationship_nature', 'emotional_significance'];
+
 function executeEntityMerge(survivorId, victimId) {
     const db = getDb();
-    const survivor = db.prepare('SELECT id, name, aliases FROM entity_profiles WHERE id = ?').get(survivorId);
-    const victim = db.prepare('SELECT id, name FROM entity_profiles WHERE id = ?').get(victimId);
+    const survivor = db.prepare(`SELECT id, name, aliases, ${MERGE_CARRY_COLS.join(', ')} FROM entity_profiles WHERE id = ?`).get(survivorId);
+    const victim = db.prepare(`SELECT id, name, ${MERGE_CARRY_COLS.join(', ')} FROM entity_profiles WHERE id = ?`).get(victimId);
     if (!survivor || !victim) return false;
     try {
         const doMerge = db.transaction(() => {
@@ -2226,14 +2230,23 @@ function executeEntityMerge(survivorId, victimId) {
             const ins = db.prepare('INSERT OR IGNORE INTO fragment_entities (fragment_id, entity_id, relation, confidence, classified_by) VALUES (?, ?, ?, ?, ?)');
             for (const l of victimLinks) ins.run(l.fragment_id, survivor.id, l.relation, l.confidence, l.classified_by);
             db.prepare('DELETE FROM fragment_entities WHERE entity_id = ?').run(victim.id);
-            // 败者名字进存活者 aliases
+            // 败者名字进存活者 aliases（Set 顺带去重，败者名和已有的重复项一起收掉）
             let aliases = [];
             try { aliases = JSON.parse(survivor.aliases || '[]'); } catch (_) {}
-            if (!aliases.includes(victim.name)) aliases.push(victim.name);
-            // overview 置空强制重新生成——两边概述可能互相矛盾（如把人写成猫），不能留旧的
-            db.prepare(`UPDATE entity_profiles SET aliases = ?, overview = NULL, fragment_count =
-                (SELECT COUNT(*) FROM fragment_entities WHERE entity_id = ?), updated_at = datetime('now') WHERE id = ?`)
-                .run(JSON.stringify(aliases), survivor.id, survivor.id);
+            aliases = [...new Set([...aliases, victim.name])];
+            // 存活者缺哪列关系就用败者的补上（已有的不覆盖——存活者按碎片数胜出，通常更全）
+            const relCols = [], relVals = [];
+            for (const col of MERGE_CARRY_COLS) {
+                if (!survivor[col] && victim[col]) { relCols.push(`${col} = ?`); relVals.push(victim[col]); }
+            }
+            // facts 置空强制重新生成——两边概述可能互相矛盾（如把人写成猫），不能留旧的。
+            // ⚠️ 置空的是 facts 不是 overview：v5.9 起 overview 列已退役，写入侧重写的是 facts，
+            // 置空 overview 等于写进一个没人再读、也不会被重建的列。
+            const setCols = ['aliases = ?', 'facts = NULL', ...relCols,
+                'fragment_count = (SELECT COUNT(*) FROM fragment_entities WHERE entity_id = ?)',
+                "updated_at = datetime('now')"];
+            db.prepare(`UPDATE entity_profiles SET ${setCols.join(', ')} WHERE id = ?`)
+                .run(JSON.stringify(aliases), ...relVals, survivor.id, survivor.id);
             db.prepare(`UPDATE entity_profiles SET status = 'merged', updated_at = datetime('now') WHERE id = ?`).run(victim.id);
             db.prepare(`INSERT INTO ontology_changelog (action, category_path, detail, status) VALUES ('seed_merge', ?, ?, 'done')`)
                 .run(survivor.name, JSON.stringify({ victim: victim.name, survivor: survivor.name, migrated: victimLinks.length }));
@@ -4957,6 +4970,171 @@ ${Object.entries(taskStatus).filter(([n]) => n !== 'stop').map(([n, s]) => `  ${
 }
 
 // ═══════════════════════════════════════════════════════
+// 每日主角状态（v5.13）
+// ═══════════════════════════════════════════════════════
+// 主角（USER）不在 regenerateEntityOverviews 的扫描范围里——那条查询带 SKIP_NAMES
+// 过滤，双星被整体排除。她的 current_status 由这个任务独占维护：写「X月X日：…」
+// 形式的日志行，今天条目前置、旧行不可变、最多留 DAILY_STATUS_MAX_LINES 行。
+//
+// ⚠️ entityProfile.js / lifecycle.js 那边是靠「看到主角就跳过、不写」来避让的
+// （见各自注释「由每日 cron 独占维护」）。所以这个任务不跑，主角星座不是被覆盖，
+// 是根本没人写——点开永远是空的。
+//
+// 时区：按运行环境的 TZ 判定「昨天」（容器在 docker-compose 里已设 TZ）。
+// 库里的时间统一存 UTC，所以用 SQLite 的 localtime 换算，两边口径一致。
+
+const DAILY_STATUS_MAX_LINES = 10;
+
+// 目标日期（'YYYY-MM-DD'）：不传就是「昨天」（按运行环境时区），传 Date 则用那天。
+function resolveDailyStatusDate(targetDate) {
+    const explicit = targetDate instanceof Date && !isNaN(targetDate);
+    const base = explicit ? targetDate : new Date();
+    const p = Object.fromEntries(new Intl.DateTimeFormat('en-CA', {
+        year: 'numeric', month: '2-digit', day: '2-digit',
+    }).formatToParts(base).map(x => [x.type, x.value]));
+    let d = new Date(Date.UTC(+p.year, +p.month - 1, +p.day));
+    if (!explicit) d = new Date(d.getTime() - 86400000);
+    const pad = n => String(n).padStart(2, '0');
+    return {
+        y: d.getUTCFullYear(), m: d.getUTCMonth() + 1, day: d.getUTCDate(),
+        str: `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}`,
+    };
+}
+
+async function generateDailyEntityStatus(targetDate) {
+    const db = getDb();
+    const examplesBlock = getDailyStatusExamples();
+    const t = resolveDailyStatusDate(targetDate);
+    const datePrefix = `${t.m}月${t.day}日：`;
+
+    const ent = db.prepare(
+        "SELECT id, name, category, current_status FROM entity_profiles WHERE name = ? AND status = 'active'"
+    ).get(USER.name);
+    if (!ent) {
+        console.log(`[DailyStatus] 未找到主角星座「${USER.name}」，跳过`);
+        return { updated: 0 };
+    }
+
+    console.log(`[DailyStatus] 开始每日状态总结 — ${datePrefix.replace('：', '')}`);
+
+    // 目标日（当地）的碎片；库里的 created_at 是 UTC，用 localtime 折算回当地日期
+    const frags = db.prepare(`
+        SELECT mf.content, COALESCE(mf.source_date, DATE(mf.created_at, 'localtime')) AS date,
+               mf.emotional_weight
+        FROM memory_fragments mf
+        JOIN fragment_entities fe ON fe.fragment_id = mf.id
+        WHERE fe.entity_id = ?
+          AND DATE(mf.created_at, 'localtime') = ?
+        ORDER BY mf.created_at DESC
+        LIMIT 20
+    `).all(ent.id, t.str);
+
+    // 昨天没碎片 → 写一行「无明显变化」（日志要连续，缺行比空行更难读）
+    if (frags.length === 0) {
+        const noChangeLine = datePrefix + '无明显变化。';
+        const existing = ent.current_status || '';
+        const lines = existing.split('\n').filter(l => /^\d+月\d+日[：:]/.test(l.trim()));
+        const oldLines = lines.filter(l => !l.startsWith(datePrefix));
+        const newStatus = [noChangeLine, ...oldLines.slice(0, DAILY_STATUS_MAX_LINES - 1)].join('\n');
+        db.prepare(`UPDATE entity_profiles SET current_status = ?, updated_at = datetime('now') WHERE id = ?`)
+            .run(newStatus, ent.id);
+        console.log('[DailyStatus] 无明显变化');
+        return { updated: 1 };
+    }
+
+    const fragBlock = frags.map((f, i) => {
+        const dateStr = (f.date || '?').slice(5);
+        const w = typeof f.emotional_weight === 'number' ? ` [w:${f.emotional_weight.toFixed(0)}]` : '';
+        return `[${i + 1}] (${dateStr})${w} ${(f.content || '').slice(0, 350)}`;
+    }).join('\n');
+
+    const prompt = `<task>
+以下是 ${USER.name}（用户本人）昨天（${datePrefix.replace('：', '')}）的记忆碎片：
+
+${fragBlock}
+
+请为昨天写一行总结。格式："${datePrefix}xxx。"
+
+你是信息提取器，不是日记作家。读者需要看完这一行就知道昨天发生了什么——具体的人名、地名、事件名是你给读者的锚点。没名字的动词（「参加了一个活动」「跟一个人吃了饭」）等于没写。
+
+像写日记一样客观记录昨天发生的事。标准：
+- 外部行为优先：去了哪里、见了谁、做了什么事、做了什么决定。内在情绪不写。
+- 私密互动只写事件类型，不写具体内容/台词。
+- 已经知道的信息不说成"发现"——之前就知道的事写"(此前已...)"，新发生的写"今天..."
+- 不确定的细节直接跳过。模糊信息不如不写。
+- 昨天没值得记的事 → 输出"${datePrefix}无明显变化。"
+- ≤150字，一行。
+
+优秀案例（注意格式、密度、客观性）：
+${examplesBlock}
+
+只输出一行文本。不要 JSON、不要解释、不要 Markdown。
+</task>`;
+
+    try {
+        const generationConfig = { temperature: 0.3, maxOutputTokens: 200, thinkingConfig: { thinkingBudget: 0 } };
+        let response = await callLLM(
+            [{ role: 'user', parts: [{ text: prompt }] }],
+            null, null, generationConfig, ARCHIVIST_LLM_CONFIG_ID
+        );
+        let raw = (response?.reply || '').trim();
+        if (!raw || raw.length < 4) {   // 空返回 → 降一档温度重试一次
+            console.warn('[DailyStatus] 空返回，重试中...');
+            try {
+                const retry = await callLLM(
+                    [{ role: 'user', parts: [{ text: prompt }] }],
+                    null, null, { ...generationConfig, temperature: 0.1 }, ARCHIVIST_LLM_CONFIG_ID
+                );
+                raw = (retry?.reply || '').trim();
+            } catch (_) {}
+        }
+        if (!raw || raw.length < 4) {
+            console.warn('[DailyStatus] 空返回（重试后），跳过');
+            return { updated: 0 };
+        }
+
+        // prompt 原文泄漏 / 残句检测：模型偶尔把任务说明复读回来
+        const GARBAGE_STARTS = ['<task>', '相关碎片', '只输出', '你是信息', '请为昨天', 'Only output', 'Analyze', 'Summary'];
+        if (GARBAGE_STARTS.some(s => raw.startsWith(s)) || /^[)\]}>.,;:!?`'"\\]/.test(raw)) {
+            console.warn(`[DailyStatus] 疑似 prompt 泄漏或残句，跳过 — "${raw.slice(0, 40)}"`);
+            return { updated: 0 };
+        }
+
+        let statusText = raw
+            .replace(/^["'「]|["'」]$/g, '')
+            .replace(/```[\s\S]*?```/g, '')
+            .trim()
+            .slice(0, 200);
+
+        // 补日期前缀 + 确保中文全角冒号
+        if (!statusText.startsWith(datePrefix)) {
+            statusText = datePrefix + statusText.replace(/^[：:]\s*/, '');
+        }
+        if (statusText.indexOf('：') === -1 && statusText.indexOf(':') > -1) {
+            statusText = statusText.replace(':', '：');
+        }
+        if (!statusText.slice(datePrefix.length).trim()) {
+            console.warn('[DailyStatus] 只返回了日期前缀，跳过写入');
+            return { updated: 0 };
+        }
+
+        // 前置今天这一行；旧行不可变，只剔除同一天的历史行和不合格式的残留
+        const existing = ent.current_status || '';
+        const lines = existing.split('\n').filter(l => /^\d+月\d+日[：:]/.test(l.trim()));
+        const oldLines = lines.filter(l => !l.startsWith(datePrefix));
+        const newStatus = [statusText, ...oldLines.slice(0, DAILY_STATUS_MAX_LINES - 1)].join('\n');
+
+        db.prepare(`UPDATE entity_profiles SET current_status = ?, updated_at = datetime('now') WHERE id = ?`)
+            .run(newStatus, ent.id);
+        console.log(`[DailyStatus] ${statusText.slice(0, 100)}`);
+        return { updated: 1 };
+    } catch (e) {
+        console.error('[DailyStatus] 失败:', e.message);
+        return { updated: 0 };
+    }
+}
+
+// ═══════════════════════════════════════════════════════
 // Exports
 // ═══════════════════════════════════════════════════════
 
@@ -4998,4 +5176,8 @@ module.exports = {
     regenerateEntityOverviews,
     consolidateCategory,
     scanContentForNewEntities,
+
+    // 每日主角状态（cron 调用；entityProfile/lifecycle 靠「跳过主角」避让，别改成
+    // 只在这儿写——两处都写会互相漂移）
+    generateDailyEntityStatus,
 };

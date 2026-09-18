@@ -8,8 +8,13 @@ const session = require('express-session');
 const path = require('path');
 const { initDatabase } = require('./database');
 const { CONFIG } = require('./config');
+const { registerCronJobs } = require('./tasks/cron');
 
 const db = initDatabase();
+
+// 后台记忆管线（Archivist 自主循环 + Scribe + 每日任务）。
+// 只挂路由不启管线的话，库不会自己长：消息进来没人提取、碎片没人分类、星座不增加。
+registerCronJobs();
 
 const app = express();
 app.set('trust proxy', 1);
